@@ -1,0 +1,1039 @@
+---
+title: "Marketing Analytics"
+author: "Yosr"
+date: "2025-03-04"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(arrow)
+library(dplyr)
+library(data.table)
+library(tidyr)
+library(duckdb)
+library(DBI)
+library(ggplot2)
+library(lubridate)
+#install.packages("biglm")
+install.packages("sgd")         # For stochastic gradient descent
+library(sgd)
+library(biglm)
+library(sgd)
+library(xgboost)
+```
+
+```{r}
+setwd("C:/Users/Yoser/Masters/Ca'Foscari/2 anno/Marketing Analytics/Parquet files")
+```
+
+# Section 0
+
+```{r}
+jan = read_parquet("yellow_tripdata_2023-01.parquet")
+feb = read_parquet("yellow_tripdata_2023-02.parquet")
+mar = read_parquet("yellow_tripdata_2023-03.parquet")
+apr = read_parquet("yellow_tripdata_2023-04.parquet")
+may = read_parquet("yellow_tripdata_2023-05.parquet")
+jun = read_parquet("yellow_tripdata_2023-06.parquet")
+jul = read_parquet("yellow_tripdata_2023-07.parquet")
+aug = read_parquet("yellow_tripdata_2023-08.parquet")
+sep = read_parquet("yellow_tripdata_2023-09.parquet")
+oct = read_parquet("yellow_tripdata_2023-10.parquet")
+nov = read_parquet("yellow_tripdata_2023-11.parquet")
+dec = read_parquet("yellow_tripdata_2023-12.parquet")
+```
+
+```{r}
+names(jan)[names(jan) == "airport_fee"] = "Airport_fee"
+```
+
+```{r}
+df_combined <- bind_rows(jan, feb, mar, apr, may, jun, jul, aug, sep, oct, nov, dec)
+
+```
+
+
+```{r}
+# Write the combined data to a new parquet file
+write_parquet(df_combined, "full_data.parquet")
+```
+
+# Section 1
+
+```{r}
+data = read_parquet("full_data.parquet")
+setnames(data, tolower(names(data)))
+
+```
+
+
+```{r}
+missing_values <- data %>%
+  summarise(across(everything(), ~ sum(is.na(.)), .names = "missing_{.col}")) %>%
+  pivot_longer(everything(), names_to = "column_name", values_to = "missing_count") %>%
+  arrange(desc(missing_count))
+print(missing_values)
+```
+
+```{r}
+# Remove rows with any missing values
+df_no_missings <- data %>%
+  filter(if_all(everything(), ~ !is.na(.)))
+```
+
+```{r}
+# Count duplicates (grouping by all columns)
+duplicate_count <- df_no_missings %>%
+  group_by(across(everything())) %>%
+  summarise(count = n(), .groups = "drop") %>%
+  filter(count > 1) %>%
+  summarise(total_duplicates = sum(count) - n())
+print(duplicate_count)
+
+# Remove duplicate rows
+df_no_missings <- df_no_missings %>% distinct()
+```
+
+```{r}
+df_no_missings <- df_no_missings %>%
+  mutate(
+    tpep_pickup_datetime  = as.POSIXct(tpep_pickup_datetime, format = "%Y-%m-%d %H:%M:%S", tz = "UTC"),
+    tpep_dropoff_datetime = as.POSIXct(tpep_dropoff_datetime, format = "%Y-%m-%d %H:%M:%S", tz = "UTC")
+  )
+```
+
+```{r}
+# Summarise invalid pickup and dropoff datetimes (not in 2023)
+temporal_summary <- df_no_missings %>%
+  summarise(
+    invalid_pickups  = sum(!(tpep_pickup_datetime >= as.POSIXct("2023-01-01") & 
+                               tpep_pickup_datetime <= as.POSIXct("2023-12-31"))),
+    invalid_dropoffs = sum(!(tpep_dropoff_datetime >= as.POSIXct("2023-01-01") & 
+                               tpep_dropoff_datetime <= as.POSIXct("2023-12-31")))
+  )
+print(temporal_summary)
+```
+
+
+```{r}
+# Exclude only rows where both pickup and dropoff are outside of 2023
+df_no_missings <- df_no_missings %>%
+  filter(
+    (tpep_pickup_datetime >= as.POSIXct("2023-01-01") & tpep_pickup_datetime <= as.POSIXct("2023-12-31")) |
+      (tpep_dropoff_datetime >= as.POSIXct("2023-01-01") & tpep_dropoff_datetime <= as.POSIXct("2023-12-31"))
+  )
+```
+
+```{r}
+# Calculate ride_time in minutes using the difference between dropoff and pickup times
+df_final <- df_no_missings %>%
+  mutate(trip_duration = as.numeric(difftime(tpep_dropoff_datetime, tpep_pickup_datetime, units = "mins")))
+
+```
+
+```{r}
+# Filter out inconsistent rides:
+#  - Remove rows where dropoff occurs before pickup
+#  - Remove rows with ride_time greater than 1440 minutes (24 hours)
+df_final <- df_final %>%
+  filter(tpep_dropoff_datetime >= tpep_pickup_datetime, trip_duration <= 1440)
+```
+
+```{r}
+df_final <- df_final %>%
+  filter(
+    tpep_pickup_datetime <= tpep_dropoff_datetime,  # Remove pickups after dropoffs
+    trip_duration > 0 & trip_duration < 100,  # Trip duration should be valid
+    total_amount > 0 & total_amount < 150,  # Reasonable fare
+    trip_distance > 0 & trip_distance < 35  # Realistic trip distance
+  )
+```
+
+```{r}
+df_final <- df_final %>%
+  filter(total_amount >= 0)
+
+```
+
+```{r}
+# Save the time-cleaned dataset
+write_parquet(data, "final_data.parquet")
+```
+
+Start here with clean data:
+
+```{r}
+data = read_parquet("final_data.parquet")
+```
+
+```{r}
+numeric_columns <- c(
+  "passenger_count", "trip_distance", "ratecodeid", "fare_amount", 
+  "extra", "mta_tax", "tip_amount", "tolls_amount", "improvement_surcharge",
+  "total_amount", "congestion_surcharge", "airport_fee", "trip_duration"
+)
+
+# Filter out any columns that might not exist in your dataset
+numeric_columns <- intersect(numeric_columns, names(data))
+
+# Create a custom summarise across these numeric columns
+summary_stats <- data %>%
+  summarise(
+    across(all_of(numeric_columns),
+           list(min = ~min(.x, na.rm = TRUE),
+                max = ~max(.x, na.rm = TRUE),
+                mean = ~mean(.x, na.rm = TRUE),
+                sd = ~sd(.x, na.rm = TRUE)),
+           .names = "{.col}_{.fn}")
+  )
+
+print(summary_stats)
+
+```
+
+```{r}
+detect_outliers <- function(data, column) {
+  vals <- data[[column]]
+  q1 <- quantile(vals, 0.25, na.rm = TRUE)
+  q3 <- quantile(vals, 0.75, na.rm = TRUE)
+  iqr_val <- q3 - q1
+  lower_bound <- q1 - 1.5 * iqr_val
+  upper_bound <- q3 + 1.5 * iqr_val
+  
+  # Count how many values are outside these bounds
+  outlier_count <- sum(vals < lower_bound | vals > upper_bound, na.rm = TRUE)
+  
+  cat("Column:", column, "\n")
+  cat("Lower Bound:", lower_bound, "| Upper Bound:", upper_bound, "\n")
+  cat("Outliers detected:", outlier_count, "\n\n")
+  
+  return(list(column = column, lower = lower_bound, upper = upper_bound, outliers = outlier_count))
+}
+
+# Example usage for trip_distance, total_amount, ride_time
+out_trip_distance <- detect_outliers(data, "trip_distance")
+out_total_amount  <- detect_outliers(data, "total_amount")
+out_ride_time     <- detect_outliers(data, "trip_duration")
+
+```
+
+```{r}
+# Filter: total_amount > 0 & total_amount <= 150
+#df_total_amount <- data %>% filter(total_amount > 0, total_amount <= 150)
+
+ggplot(total_amount_density, aes(x = total_amount)) +
+  geom_density(fill = met.brewer("Degas")[5], alpha = 0.6) +
+  scale_x_continuous(breaks = seq(0, 500, 50)) +  
+  theme_minimal() +
+  labs(title = "Density Plot of Total Amount",
+       x = "Total Amount (USD)",
+       y = "Density") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        plot.title = element_text(face = "bold", size = 14),
+        axis.title = element_text(size = 12))
+
+```
+
+```{r}
+# Filter: trip_distance > 0 & trip_distance <= 35
+#df_trip_distance <- data %>% filter(trip_distance > 0, trip_distance <= 35)
+
+ggplot(trip_distance_density, aes(x = trip_distance)) +
+  geom_density(fill = met.brewer("Degas")[2], alpha = 0.6) +
+  scale_x_continuous(breaks = seq(0, 500, 5)) +  # Schritte von 5 auf der x-Achse
+  theme_minimal() +
+  labs(title = "Density Plot of Trip Distance",
+       x = "Distance (miles)",
+       y = "Density") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        plot.title = element_text(face = "bold", size = 14),
+        axis.title = element_text(size = 12))
+
+```
+
+```{r}
+# Filter: ride_time > 0 & ride_time <= 100
+#df_ride_time <- data %>% filter(ride_time > 0, ride_time <= 100)
+
+ggplot(ride_time_density, aes(x = ride_time)) +
+  geom_density(fill = met.brewer("Degas")[1], alpha = 0.6) +
+  scale_x_continuous(breaks = seq(0, 500, 15)) +  
+  theme_minimal() +
+  labs(title = "Density Plot of Ride Time",
+       x = "Ride Time (minutes)",
+       y = "Density") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        plot.title = element_text(face = "bold", size = 14),
+        axis.title = element_text(size = 12))
+
+```
+
+```{r}
+average_tips_per_day <- data %>% mutate(day_of_week = weekdays(tpep_pickup_datetime)) %>% 
+  group_by(day_of_week) %>%
+  summarise(average_tip = mean(tip_amount, na.rm = TRUE), .groups = "drop")
+
+ggplot(average_tips_per_day, aes(x = day_of_week, y = average_tip, fill = day_of_week)) +
+  geom_col() +
+  theme_minimal() +
+  labs(
+    title = "Average Tip Amount by Weekday",
+    x = "Day of the Week",
+    y = "Average Tip Amount ($)"
+  ) +
+  scale_fill_brewer(palette = "Set3") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "none")
+
+```
+
+```{r}
+ggplot(hourly_rides, aes(x = pickup_hour, y = ride_count, fill = factor(pickup_hour))) +
+  geom_col(show.legend = FALSE) +
+  scale_x_continuous(breaks = seq(0, 23, 1)) + 
+  scale_fill_manual(values = met.brewer("Degas", n = 24)) +  
+  theme_minimal() +
+  labs(title = "Peak Hours for Taxi Rides",
+       x = "Hour of the Day",
+       y = "Number of Rides") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+trip_counts_by_hour <- final_data
+
+# Filter data for Weekends
+weekend_data <- subset(trip_counts_by_hour, day_type == "Weekend")
+
+# Weekday Line Chart
+ggplot(weekday_data, aes(x = pickup_hour, y = trip_count)) +
+  geom_line(color = "#42522e", size = 1.2) +  # Degas Blue
+  geom_area(fill = "#42522e", alpha = 0.3) +  # Light blue fill
+  labs(title = "Hourly Taxi Demand (Weekdays)",
+       x = "Hour of the Day", y = "Number of Trips") +
+  theme_minimal()  
+
+# Weekend Line Chart
+ggplot(weekend_data, aes(x = pickup_hour, y = trip_count)) +
+  geom_line(color = "#4c1d19", size = 1.2) +  # Degas Red
+  geom_area(fill = "#4c1d19", alpha = 0.3) +
+  labs(title = "Hourly Taxi Demand (Weekends)",
+       x = "Hour of the Day", y = "Number of Trips") +
+  theme_minimal() 
+```
+
+```{r}
+total_amount_per_day <- data %>% mutate(day_of_week = weekdays(tpep_pickup_datetime)) %>% 
+  group_by(day_of_week) %>%
+  summarise(avg_total_amount = mean(total_amount, na.rm = TRUE), .groups = "drop")
+
+ggplot(total_amount_per_day, aes(x = day_of_week, y = avg_total_amount, fill = day_of_week)) +
+  geom_col() +
+  theme_minimal() +
+  labs(
+    title = "Average Total Ride Amount by Weekday",
+    x = "Day of the Week",
+    y = "Average Total Amount ($)"
+  ) +
+  scale_fill_brewer(palette = "Set2") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "none")
+
+```
+
+To plot the pickups per location, the available data needed to be merged with location
+data from the shapefile available at the NYC Taxi Commission website. This was operated using
+DuckDB to efficiently manage memory.
+
+```{r}
+# Query DuckDB to get pickup counts per location ID
+query <- "
+SELECT 
+  pulocationid AS location_id,
+  COUNT(*) AS pickup_count
+FROM final_clean
+GROUP BY pulocationid
+ORDER BY pickup_count DESC;
+"
+
+# Retrieve data
+pickup_density <- dbGetQuery(con, query)
+
+# Plot heatmap with ggplot2
+ggplot(pickup_density, aes(x = location_id, y = pickup_count, fill = pickup_count)) +
+  geom_tile() + 
+  scale_fill_viridis_c(option = "magma") +
+  labs(title = "Pickup Density by Location ID", x = "Pickup Location ID", y = "Trip Count") +
+  theme_minimal()
+head(pickup_density)
+
+### join with shapefile
+
+# Load the shapefile
+taxi_zones <- st_read("/Users/hannahheyne/Desktop/M.Sc./Erasmus/Marketing_Intelligence/Taxi/taxi_zones.shp")  
+
+# Inspect data
+head(taxi_zones)
+
+query <- "
+SELECT 
+  pulocationid AS location_id,
+  COUNT(*) AS pickup_count
+FROM final_clean
+WHERE pulocationid IS NOT NULL
+GROUP BY pulocationid
+ORDER BY pickup_count DESC;
+"
+
+pickup_density <- dbGetQuery(con, query)
+head(pickup_density)
+## we now want to merge the shapefile with our location IDs
+# Ensure column names match before merging
+colnames(taxi_zones) <- tolower(colnames(taxi_zones))  # Standardize column names
+colnames(pickup_density) <- tolower(colnames(pickup_density))
+
+# Perform a left join to merge the trip counts with the geographic data
+taxi_zones_joined <- taxi_zones %>%
+  left_join(pickup_density, by = c("locationid" = "location_id"))
+
+# Replace NA values with 0 (zones with no pickups)
+taxi_zones_joined$pickup_count[is.na(taxi_zones_joined$pickup_count)] <- 0
+
+ggplot(taxi_zones_joined) +
+  geom_sf(aes(fill = pickup_count), color = "black", size = 0.1) +  # Heatmap with borders
+  scale_fill_viridis_c(option = "magma", trans = "log", name = "Trip Density") +  # Log scale for better contrast
+  labs(title = "NYC Yellow Taxi Pickup Density",
+       subtitle = "Based on Trip Data",
+       caption = "Data: NYC TLC | Visualization: ggplot2 + sf") +
+  theme_minimal()
+```
+
+
+# Section 2
+## Revenue Analysis:
+
+```{r}
+df_revenue <- data %>%
+  select(
+    RatecodeID,
+    tpep_pickup_datetime,   # Needed to analyze time-based revenue trends
+    tpep_dropoff_datetime,  # Needed for trip duration (if required later)
+    trip_distance,          # May be useful for trip-based revenue analysis
+    fare_amount,            # Base metered fare
+    extra,                  # Additional surcharges
+    mta_tax,                # Fixed NYC tax per trip
+    tip_amount,             # Tips from passengers
+    tolls_amount,           # Toll charges
+    improvement_surcharge,  # NYC improvement surcharge
+    congestion_surcharge,   # Congestion fee
+    Airport_fee,            # Airport pickup fee (if applicable)
+    total_amount,           # Final amount charged to the passenger
+    payment_type
+  )
+```
+
+The Total_amount variable includes surcharges and taxes that do not count as actual revenue for the taxi company. To get the true revenue per trip, we need to adjust it by removing pass-through costs that are collected and sent elsewhere:
+
+-   MTA_tax (\$0.50) → Paid to the government, not revenue.
+-   Improvement_surcharge (\$0.30) → Goes to the TLC, not revenue.
+-   Congestion_Surcharge (\$2.50) → Collected and passed to the state, not revenue.
+-   Airport_fee (\$1.25 at JFK/LGA pickups) → Regulatory charge, not revenue.
+-   Tip_amount → Belongs to the driver, not the taxi company.
+-   Tolls_amount → Collected from the passenger and paid to toll authorities, not revenue.
+We assume that:
+The company retains fare_amount and extra charges.
+Tips and tolls go to the driver.
+Taxes and surcharges (mta_tax, improvement_surcharge, congestion_surcharge, airport_fee) are pass-through.
+#
+
+```{r}
+df_revenue <- df_revenue %>% mutate(revenue_per_trip = fare_amount + extra)
+```
+
+```{r}
+total_revenue <- df_revenue %>%
+  summarise(total_revenue = sum(revenue_per_trip, na.rm = TRUE))
+
+total_revenue
+```
+
+```{r}
+ggplot(df_revenue, aes(x = revenue_per_trip)) +
+  geom_histogram(binwidth = 2, fill = "steelblue", color = "black", alpha = 0.7) +
+  labs(title = "Distribution of Revenue per Trip", x = "Revenue per Trip ($)", y = "Number of Trips") +
+  theme_minimal()
+
+```
+```{r}
+# Extract hour from datetime
+df_revenue <- df_revenue %>%
+  mutate(hour_of_day = hour(tpep_pickup_datetime))
+
+# Calculate average revenue per hour
+revenue_by_hour <- df_revenue %>%
+  group_by(hour_of_day) %>%
+  summarise(avg_revenue = mean(revenue_per_trip, na.rm = TRUE))
+
+ggplot(revenue_by_hour, aes(x = hour_of_day, y = avg_revenue)) +
+  geom_line(color = "darkorange", size = 1) +
+  geom_point(color = "red", size = 2) +
+  labs(title = "Average Revenue by Hour of the Day", x = "Hour of the Day", y = "Average Revenue ($)") +
+  theme_minimal()
+```
+
+
+```{r}
+df_5am <- df_revenue %>% filter(pickup_hour == "05")
+summary(df_5am$trip_distance)
+summary(df_5am$revenue_per_trip)
+```
+
+```{r}
+nrow(df_5am)
+```
+A relatively small subset of high-fare (likely airport) trips can inflate the average revenue, even if overall trip counts are lower at that hour.
+
+```{r}
+df_revenue %>% 
+  group_by(pickup_hour, RatecodeID) %>%
+  summarize(mean_revenue = mean(revenue_per_trip, na.rm = TRUE),
+            count = n()) %>%
+  filter(pickup_hour == "05") %>%
+  arrange(desc(mean_revenue))
+
+```
+
+
+
+
+## Cost Analysis:
+
+### Cost Components :
+
+-   Fuel Cost: Estimated based on trip distance.We use an assumption of both fuel price and fuel efficiency. For taxis, many in NYC are hybrid models which can travel 50 miles per gallon of fuel. Traditional gasoline-powered taxi models averaged 12-15 MPG.
+-   Driver Cost: Estimated using trip duration. We are using an assumption of an average hourly wage of about $20.76, assuming a full-time schedule of 2,080 hours per year (40 hours per week). However, actual earnings can vary based on factors such as experience, hours worked, and tips.
+-   Vehicle Maintenance Cost: Fixed per trip. Maintenance expenses for such vehicles can vary significantly based on factors like vehicle type, age, mileage, and usage intensity. Regular maintenance typically includes oil changes, brake servicing, tire replacements, and other routine checks. The annual maintenance cost is around $5,000$ to $10,000$ per year. On average, let's say about $1 per trip (assuming it's a full time taxi driver with 25-40 trips a day, working six days per week). The average duration of a trip is 3.58 miles. 
+-   Toll Costs: Already included in dataset (tolls_amount).
+-   Other Possible Costs: We are considering include insurance and licensing fees. NYC taxis require high-liability coverage. We estimated an average range of $5,000$ per year. Insurance costs vary based on factors like the driver’s record, taxi model, and provider. NYC taxis require high-liability coverage, which increases costs. Yellow taxi vehicle owners must either own or lease a Yellow Taxicab Medallion. Medallion lease fee: $1,500$ per month
+
+```{r}
+mean(data$trip_distance, na.rm = TRUE)
+
+```
+
+
+```{r}
+# Define cost assumptions
+fuel_price <- 3.50    # Dollars per gallon
+fuel_efficiency  <- 32         # Miles per gallon; how much fuel a vehicle consumes to travel a certain distance
+driver_hourly_wage <- 20.76  # Fixed driver cost per hour ($)
+maintenance_cost_per_mile <- 3.5 # Fixed maintenance cost per mile ($)
+
+```
+
+### Fuel Cost:
+
+```{r}
+df_costs <- data %>% select(
+  trip_distance,
+  trip_duration
+)
+```
+
+
+$$
+\text{Fuel Cost} = \left(\frac{\text{Trip Distance (miles)}}{\text{Fuel Efficiency (mpg)}}\right) \times \text{Fuel Price per gallon}
+$$
+
+```{r}
+df_costs <- df_costs %>%
+  mutate(Fuel_Cost = (trip_distance / fuel_efficiency) * fuel_price)
+```
+
+### Vehicle Maintenance Costs:
+
+$$
+\text{Maintenance Cost} = \text{Trip Distance} \times \text{Maintenance Cost per Mile}
+$$
+
+```{r}
+df_costs <- df_costs %>%
+  mutate(Maintenance_Cost = trip_distance * maintenance_cost_per_mile)
+```
+
+### Driver Costs:
+
+$$
+\text{Driver Cost} = \left(\frac{\text{Trip Duration (minutes)}}{60}\right) \times \text{Hourly Wage}
+$$
+
+```{r}
+df_costs <- df_costs %>%   
+  mutate(Driver_Cost = (trip_duration / 60) * driver_hourly_wage)
+```
+
+```{r}
+# Convert to per-trip cost estimate
+df_costs <- df_costs %>%
+  mutate(cost_per_trip = Fuel_Cost + Maintenance_Cost + Driver_Cost)
+```
+
+
+## Operational Margin
+
+```{r}
+data <- data %>% mutate(operational_margin = df_revenue$revenue_per_trip - df_costs$cost_per_trip)
+```
+
+
+
+
+```{r}
+df_hourly_profit <- data %>%
+  group_by(pickup_hour) %>%
+  summarize(avg_profit = mean(operational_margin, na.rm = TRUE),
+            count_trips = n())
+
+ggplot(df_hourly_profit, aes(x = factor(pickup_hour), y = avg_profit)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  labs(
+    title = "Average Profit by Hour of the Day",
+    x = "Hour of Day (0-23)",
+    y = "Average Profit ($)"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+write_parquet(data, "final_data3.parquet")
+```
+
+You can start here for the predictive challenge section
+
+```{r}
+data <- read_parquet("final_data3.parquet")
+```
+
+```{r}
+colnames(data)
+```
+
+```{r}
+data <- as.data.table(data)
+
+data[, pickup_hour := hour(tpep_pickup_datetime)]
+data[, pickup_dow  := wday(tpep_pickup_datetime, label = TRUE)]
+data[, RatecodeID := as.factor(RatecodeID)]
+data[, payment_type := as.factor(payment_type)]
+```
+
+```{r}
+hist(data$operational_margin, main = "Operational Margin Distribution")
+hist(data$trip_distance, main = "Trip Distance Distribution")
+
+```
+
+
+
+```{r}
+cor_val <- cor(data$trip_duration, data$operational_margin, use = "complete.obs")
+cat("Correlation:", cor_val, "\n")
+
+
+```
+
+```{r}
+plot(data$tip_amount, data$operational_margin,
+     xlab = "Tip Amount", ylab = "Operational Margin",
+     main = "Tips vs. Operational Margin")
+
+```
+
+```{r}
+boxplot(operational_margin ~ RatecodeID, data = data,
+        main = "Margin by Rate Code",
+        xlab = "Ratecode ID", ylab = "Operational Margin")
+
+```
+
+
+# Section 3: Predictive Challenge
+
+```{r}
+data_subset <- data %>% select(tpep_pickup_datetime, pulocationid, dolocationid, passenger_count,
+                              ratecodeid, payment_type, operational_margin)
+```
+
+
+```{r}
+prepare_data <- function(df) {
+  df %>%
+    mutate(
+      # Extract hour, day of week, month
+      pickup_hour = hour(tpep_pickup_datetime),
+      pickup_dow  = wday(tpep_pickup_datetime, week_start=1, label=TRUE, abbr=FALSE), # Monday=1, Sunday=7
+      pickup_month = month(tpep_pickup_datetime, label=TRUE, abbr=FALSE),
+      
+      # Convert location IDs, rate code, payment type to factors
+      pickup_location = as.factor(pulocationid),
+      dropoff_location = as.factor(dolocationid),
+      ratecodeid = as.factor(ratecodeid),
+      payment_type = as.factor(payment_type)
+    )
+}
+
+```
+
+
+```{r}
+# Check Memory Usage Before Running Model -------------------------------
+gc()  # Run garbage collection
+cat("Available RAM:", memory.size(), "MB\n")
+cat("Max RAM Limit:", memory.limit(), "MB\n")
+
+# Prepare Data ----------------------------------------------------------
+df_prepared <- prepare_data(data_subset)  # Your preprocessing function
+
+# Convert Factor Variables to Numeric (Needed for biglm)
+df_prepared <- as.data.table(df_prepared)
+df_prepared[, pickup_location := as.numeric(as.factor(pickup_location))]
+df_prepared[, dropoff_location := as.numeric(as.factor(dropoff_location))]
+df_prepared[, ratecodeid := as.numeric(as.factor(ratecodeid))]
+df_prepared[, payment_type := as.numeric(as.factor(payment_type))]
+
+# Define Features -------------------------------------------------------
+features <- c("pickup_hour", "pickup_dow", "pickup_month", 
+              "pickup_location", "dropoff_location",
+              "ratecodeid", "payment_type")
+# Convert all feature columns to numeric in the entire dataset
+df_prepared[, (features) := lapply(.SD, function(col) as.numeric(as.factor(col))), .SDcols = features]
+```
+
+
+```{r}
+write_parquet(df_prepared, "df_prepared")
+```
+
+
+```{r}
+df_prepared <- read_parquet("df_prepared")
+```
+
+```{r}
+# Train-test split ----------------------------------------------------
+set.seed(123)
+train_indices <- sample(nrow(df_prepared), size = 0.7 * nrow(df_prepared))
+train_data <- df_prepared[train_indices, ]
+test_data  <- df_prepared[-train_indices, ]
+
+# Define Model Formula ------------------------------------------------
+formula <- operational_margin ~ pickup_hour + pickup_dow + pickup_month + 
+                              pickup_location + dropoff_location +
+                              ratecodeid + payment_type
+```
+
+1. Linear Regression using biglm
+
+```{r}
+# Fit Initial Model Using First Chunk of Data -------------------------
+chunk_size <- 1e5  
+train_chunk <- train_data[1:min(chunk_size, .N), ]  # Take first chunk
+
+biglm_model <- biglm(formula, data = train_chunk)
+
+# Incrementally Update Model with Remaining Data ----------------------
+for (i in seq(chunk_size + 1, nrow(train_data), by = chunk_size)) {
+  cat("Processing rows:", i, "to", min(i + chunk_size - 1, nrow(train_data)), "\n")
+  
+  chunk <- train_data[i:min(i + chunk_size - 1, nrow(train_data)), ]
+  biglm_model <- update(biglm_model, chunk)  # Update model with new chunk
+}
+
+# Make Predictions & Evaluate ----------------------------------------
+preds <- predict(biglm_model, newdata = test_data)
+actuals <- test_data$operational_margin
+
+# Calculate RMSE
+rmse <- sqrt(mean((preds - actuals)^2))
+cat("RMSE on test set:", rmse, "\n")
+```
+
+
+```{r}
+
+# View model summary (coefficients & significance)
+summary(biglm_model)
+
+# Check model coefficients (impact of each variable)
+coef(biglm_model)
+
+# Print RMSE (how well the model performs)
+cat("RMSE on test set:", rmse, "\n")
+
+
+```
+
+```{r}
+summary(test_data$operational_margin)
+sd_value <- sd(test_data$operational_margin)
+print(sd_value)
+
+```
+
+```{r}
+# Save the model as an RDS file
+saveRDS(biglm_model, file = "biglm_model.rds")
+
+```
+
+2. Stochastic Gradient Descent Model
+
+```{r}
+# Check Memory Usage Before Running Model -------------------------------
+gc()  # Run garbage collection
+cat("Available RAM:", memory.size(), "MB\n")
+cat("Max RAM Limit:", memory.limit(), "MB\n")
+
+# Fit Model Using SGD in Chunks ----------------------------------------
+chunk_size <- 5e4  
+model_coeff <- NULL  # To hold coefficients from previous chunks
+sgd_model <- NULL    # To store the current sgd model object
+
+```
+
+
+```{r}
+for (i in seq(1, nrow(train_data), by = chunk_size)) {
+  cat("Processing rows:", i, "to", min(i + chunk_size - 1, nrow(train_data)), "\n")
+  
+  chunk <- train_data[i:min(i + chunk_size - 1, nrow(train_data)), ]
+  
+  # Manually create the design matrix with a constant intercept column
+  x_chunk <- cbind(
+    intercept      = 1,
+    pickup_hour    = chunk$pickup_hour,
+    pickup_dow     = chunk$pickup_dow,
+    pickup_month   = chunk$pickup_month,
+    pickup_location= chunk$pickup_location,
+    dropoff_location = chunk$dropoff_location,
+    ratecodeid     = chunk$ratecodeid,
+    payment_type   = chunk$payment_type
+  )
+  
+  y_chunk <- chunk$operational_margin
+  
+  # Now x_chunk will always have 8 columns.
+  # Use x_chunk and y_chunk in your sgd call, and update your model.
+  if (is.null(model_coeff)) {
+    sgd_model <- sgd(x = x_chunk, y = y_chunk, model = "lm")
+  } else {
+    sgd_model <- sgd(
+      x = x_chunk, 
+      y = y_chunk, 
+      model = "lm",
+      sgd.control = list(start = model_coeff)
+    )
+  }
+  
+  model_coeff <- coef(sgd_model)
+  
+  # Clean up
+  rm(chunk, x_chunk, y_chunk)
+  gc()
+}
+
+```
+```{r}
+# Build the Design Matrix for the Test Set
+x_test <- cbind(
+  intercept        = 1,
+  pickup_hour      = test_data$pickup_hour,
+  pickup_dow       = test_data$pickup_dow,
+  pickup_month     = test_data$pickup_month,
+  pickup_location  = test_data$pickup_location,
+  dropoff_location = test_data$dropoff_location,
+  ratecodeid       = test_data$ratecodeid,
+  payment_type     = test_data$payment_type
+)
+x_test <- as.matrix(x_test)
+
+# Generate Predictions Using the Final sgd Model
+preds <- predict(sgd_model, newdata = x_test)
+
+# Calculate the RMSE to Assess Performance
+actuals <- test_data$operational_margin
+rmse <- sqrt(mean((preds - actuals)^2))
+cat("RMSE on test set:", rmse, "\n")
+
+```
+```{r}
+print(coef(sgd_model))
+```
+```{r}
+summary(sgd_model)
+
+```
+
+```{r}
+
+
+# Incremental Training with xgboost ------------------------------------
+chunk_size <- 1e5  
+xgb_model <- NULL  # Will hold the continuously updated model
+
+# Set basic xgboost parameters
+params <- list(
+  objective = "reg:squarederror",
+  eval_metric = "rmse"
+)
+
+
+# Process the training data in chunks
+for (i in seq(1, nrow(train_data), by = chunk_size)) {
+  cat("Processing rows:", i, "to", min(i + chunk_size - 1, nrow(train_data)), "\n")
+  
+  # Subset the current chunk
+  chunk <- train_data[i:min(i + chunk_size - 1, nrow(train_data)), ]
+  
+  # Build the design matrix (predictors) and target vector
+  x_chunk <- as.matrix(chunk[, ..features])
+  y_chunk <- chunk$operational_margin
+  
+  # Create a DMatrix for this chunk
+  dtrain <- xgb.DMatrix(data = x_chunk, label = y_chunk)
+  
+  # Train on the current chunk, warm starting from previous rounds if available.
+  # You can adjust nrounds per chunk as needed.
+  nrounds <- 10  
+  xgb_model <- xgb.train(
+    params = params,
+    data = dtrain,
+    nrounds = nrounds,
+    xgb_model = xgb_model  # This continues training from the previous model
+  )
+  
+  # Clean up to free memory
+  rm(chunk, x_chunk, y_chunk, dtrain)
+  gc()
+}
+```
+
+
+```{r}
+# Evaluate Model Performance on the Test Set ---------------------------
+# Build design matrix for test data
+x_test <- as.matrix(test_data[, ..features])
+dtest <- xgb.DMatrix(data = x_test)
+
+# Generate predictions using the final model
+preds <- predict(xgb_model, newdata = dtest)
+actuals <- test_data$operational_margin
+
+# Calculate RMSE
+rmse <- sqrt(mean((preds - actuals)^2))
+cat("Test RMSE:", rmse, "\n")
+```
+```{r}
+summary(xgb_model)
+```
+```{r}
+summary(train_data$operational_margin)
+summary(test_data$operational_margin)
+summary(preds)
+
+```
+
+# 2024 Data:
+
+```{r}
+data_2024 <- read_parquet("final_clean24.parquet")
+```
+
+```{r}
+data_subset_2024 <- data_subset_2024 %>% mutate(revenue_per_trip = fare_amount + extra)
+
+```
+
+
+### Fuel Cost:
+
+$$
+\text{Fuel Cost} = \left(\frac{\text{Trip Distance (miles)}}{\text{Fuel Efficiency (mpg)}}\right) \times \text{Fuel Price per gallon}
+$$
+
+```{r}
+data_subset_2024 <- data_subset_2024 %>%
+  mutate(Fuel_Cost = (trip_distance / fuel_efficiency) * fuel_price)
+```
+
+### Vehicle Maintenance Costs:
+
+$$
+\text{Maintenance Cost} = \text{Trip Distance} \times \text{Maintenance Cost per Mile}
+$$
+
+```{r}
+data_subset_2024 <- data_subset_2024 %>%
+  mutate(Maintenance_Cost = trip_distance * maintenance_cost_per_mile)
+```
+
+### Driver Costs:
+
+$$
+\text{Driver Cost} = \left(\frac{\text{Trip Duration (minutes)}}{60}\right) \times \text{Hourly Wage}
+$$
+
+```{r}
+data_subset_2024 <- data_subset_2024 %>%   
+  mutate(Driver_Cost = (trip_duration / 60) * driver_hourly_wage)
+```
+
+```{r}
+# Convert to per-trip cost estimate
+data_subset_2024 <- data_subset_2024 %>%
+  mutate(cost_per_trip = Fuel_Cost + Maintenance_Cost + Driver_Cost)
+```
+
+
+## Operational Margin
+
+```{r}
+data_subset_2024 <- data_subset_2024 %>% mutate(operational_margin = revenue_per_trip - cost_per_trip)
+
+```
+
+
+```{r}
+data_subset_2024 <- data_2024 %>% select(tpep_pickup_datetime, pulocationid, dolocationid, passenger_count,
+                              ratecodeid, payment_type, operational_margin)
+```
+
+
+```{r}
+# Prepare Data ----------------------------------------------------------
+df_prepared_2024 <- prepare_data(data_subset_2024)  # Your preprocessing function
+
+# Convert Factor Variables to Numeric (Needed for biglm)
+df_prepared_2024 <- as.data.table(df_prepared_2024)
+df_prepared_2024[, pickup_location := as.numeric(as.factor(pickup_location))]
+df_prepared_2024[, dropoff_location := as.numeric(as.factor(dropoff_location))]
+df_prepared_2024[, ratecodeid := as.numeric(as.factor(ratecodeid))]
+df_prepared_2024[, payment_type := as.numeric(as.factor(payment_type))]
+# Convert all feature columns to numeric in the entire dataset
+df_prepared_2024[, (features) := lapply(.SD, function(col) as.numeric(as.factor(col))), .SDcols = features]
+```
+
+
+```{r}
+# Make Predictions & Evaluate ----------------------------------------
+preds <- predict(biglm_model, newdata = df_prepared_2024)
+actuals <- df_prepared_2024$operational_margin
+
+# Calculate RMSE
+rmse <- sqrt(mean((preds - actuals)^2))
+cat("RMSE on test set:", rmse, "\n")
+```
+
+
+
+
